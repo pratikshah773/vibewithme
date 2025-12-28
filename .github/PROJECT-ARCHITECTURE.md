@@ -1,24 +1,34 @@
-# Project Architecture & Technical Specifications
+# Project Architecture & Technical Specifications — Multi-Tenant SaaS Event Platform
 
-This document provides comprehensive architecture, technology stack, and technical requirements for all AI agents and developers working on this project.
+This document provides comprehensive architecture, technology stack, and technical requirements for **EventHub**: a flexible multi-tenant SaaS platform for hosting events, selling tickets/products, managing fundraisers, and processing payments.
 
-**Last Updated:** December 22, 2025
+**Platform Purpose:**
+- **Event Organizers** create and manage events (concerts, conferences, workshops, etc.)
+- **Event Organizers** sell tickets, products, and track fundraising
+- **Buyers** discover, purchase tickets/products, and manage their bookings
+- **Platform** processes payments to a centralized merchant account and manages payouts to organizers based on commission rules
+
+**Last Updated:** December 28, 2025
 
 ---
 
 ## Table of Contents
 
 1. [Project Overview](#project-overview)
-2. [Frontend Architecture](#frontend-architecture)
-3. [Backend Architecture](#backend-architecture)
-4. [GraphQL API](#graphql-api)
-5. [Database Design](#database-design)
-6. [Observability & Monitoring](#observability--monitoring)
-7. [CI/CD & Deployment](#cicd--deployment)
-8. [Docker & Containerization](#docker--containerization)
-9. [AWS Infrastructure & Terraform](#aws-infrastructure--terraform)
-10. [Cross-Service Communication](#cross-service-communication)
-11. [Development Workflows](#development-workflows)
+2. [Multi-Tenancy & Organizational Model](#multi-tenancy--organizational-model)
+3. [Frontend Architecture](#frontend-architecture)
+4. [Backend Architecture](#backend-architecture)
+5. [GraphQL API](#graphql-api)
+6. [Database Design](#database-design)
+7. [Payment Processing & Ledger System](#payment-processing--ledger-system)
+8. [Multi-Offering Strategy (Events, Products, Fundraising)](#multi-offering-strategy)
+9. [Observability & Monitoring](#observability--monitoring)
+10. [CI/CD & Deployment](#cicd--deployment)
+11. [Docker & Containerization](#docker--containerization)
+12. [AWS Infrastructure & Terraform](#aws-infrastructure--terraform)
+13. [Security & Compliance](#security--compliance)
+14. [Cross-Service Communication](#cross-service-communication)
+15. [Development Workflows](#development-workflows)
 
 ---
 
@@ -32,6 +42,8 @@ This document provides comprehensive architecture, technology stack, and technic
 | **Backend** | ASP.NET Core | Latest Stable |
 | **API** | GraphQL (Hot Chocolate) | Latest |
 | **Database** | SQL Server (MSSQL) | Local Dev & RDS for AWS |
+| **Payment Gateway** | Stripe / Razorpay | Production APIs |
+| **Auth** | JWT + OAuth 2.0 | OpenID Connect |
 | **Observability** | OpenTelemetry + Prometheus-net + Serilog | Latest |
 | **Visualization** | Grafana Cloud | SaaS |
 | **Container Runtime** | Docker | Latest |
@@ -41,16 +53,109 @@ This document provides comprehensive architecture, technology stack, and technic
 
 ### Key Architectural Principles
 
-- **Microservices-ready:** Backend and frontend are loosely coupled.
+- **Multi-Tenancy:** Each organization (event organizer, seller) is isolated; platform is SaaS (single codebase, multi-tenant data).
+- **Flexible Offerings:** Support events (ticketed), products (for sale), fundraisers (with goals), and more via polymorphic design.
+- **Payment Centralization:** Platform collects all payments to merchant account; organizers receive payouts based on commissions.
+- **Ledger-Driven:** Every transaction (ticket sold, product purchased, refund, payout) is logged in ledger for audit trail.
 - **Observable by default:** All services emit metrics, logs, and traces from inception.
 - **Infrastructure as Code:** All AWS resources defined in Terraform; no manual AWS console changes.
 - **Containerized deployment:** All services run in Docker containers orchestrated on AWS (ECS/EKS or similar).
-- **Single Database Strategy:** Use MSSQL for all data (structured tables + JSON columns for unstructured data).
 - **Stateless services:** Backend should maintain no in-process state; use MSSQL for persistence.
+- **Role-Based Access Control (RBAC):** Support Organizer, Buyer, Admin, Support roles with granular permissions.
 
 ---
 
-## Frontend Architecture
+## Multi-Tenancy & Organizational Model
+
+### Organizational Structure
+
+EventHub supports three primary user types:
+
+1. **Event Organizers** — Create events, sell tickets/products, track sales, request payouts
+2. **Buyers** — Browse events, purchase tickets, attend events, leave reviews
+3. **Platform Admins** — Monitor platform health, manage commissions, handle disputes, process refunds
+
+### Multi-Tenant Data Isolation
+
+Each organization (event organizer) is a separate tenant:
+
+```
+EventHub Platform
+├── Tenant A (Organizer: ACME Events)
+│   ├── Events (owned by Organizer A)
+│   ├── Tickets (sold by Organizer A)
+│   ├── Products (sold by Organizer A)
+│   ├── Transactions (payments for Organizer A's items)
+│   └── Payouts (due to Organizer A)
+├── Tenant B (Organizer: XYZ Corp)
+│   ├── Events, Tickets, Products, Transactions, Payouts
+│   └── (isolated from Tenant A)
+└── Platform Admin (Global - sees all tenants for monitoring)
+```
+
+### Database-Level Tenant Isolation
+
+- Every table has `OrganizationId` (tenant identifier).
+- GraphQL resolvers filter by `organizationId` from JWT claims.
+- API Gateway/Middleware enforces tenant context per request.
+- Row-level security via views (optional, recommended for RLS at DB level).
+
+### Multi-Tenancy Example in Schema
+
+```sql
+-- Organizations table
+CREATE TABLE Organizations (
+    OrganizationId INT PRIMARY KEY IDENTITY,
+    Name NVARCHAR(255) NOT NULL,
+    Slug NVARCHAR(100) UNIQUE,
+    OwnerUserId INT NOT NULL,
+    CreatedAt DATETIME2 DEFAULT GETUTCDATE(),
+    IsActive BIT DEFAULT 1,
+    FOREIGN KEY (OwnerUserId) REFERENCES Users(UserId)
+);
+
+-- Events belong to organizations
+CREATE TABLE Events (
+    EventId INT PRIMARY KEY IDENTITY,
+    OrganizationId INT NOT NULL,  -- Tenant identifier
+    Title NVARCHAR(255) NOT NULL,
+    Description NVARCHAR(MAX),
+    EventDate DATETIME2 NOT NULL,
+    Venue NVARCHAR(MAX),
+    CreatedAt DATETIME2 DEFAULT GETUTCDATE(),
+    Status NVARCHAR(50),  -- 'draft', 'published', 'ended', 'cancelled'
+    FOREIGN KEY (OrganizationId) REFERENCES Organizations(OrganizationId)
+);
+
+-- Tickets belong to events
+CREATE TABLE Tickets (
+    TicketId INT PRIMARY KEY IDENTITY,
+    EventId INT NOT NULL,
+    OrganizationId INT NOT NULL,  -- Denormalized for query efficiency
+    TicketType NVARCHAR(100),  -- 'VIP', 'General', 'Student'
+    Price DECIMAL(10,2) NOT NULL,
+    Quantity INT NOT NULL,
+    QuantitySold INT DEFAULT 0,
+    FOREIGN KEY (EventId) REFERENCES Events(EventId),
+    FOREIGN KEY (OrganizationId) REFERENCES Organizations(OrganizationId)
+);
+```
+
+### JWT Claims for Tenant Context
+
+```json
+{
+  "sub": "user-123",
+  "name": "John Organizer",
+  "email": "john@acmeevents.com",
+  "organizationId": "org-456",
+  "organizationSlug": "acme-events",
+  "roles": ["organizer", "event_creator"],
+  "permissions": ["create:event", "view:sales", "request:payout"]
+}
+```
+
+---
 
 ### Framework & Setup
 
@@ -1007,6 +1112,980 @@ terraform destroy -var-file=environments/prod/terraform.tfvars
 - **State File Location:** AWS S3 bucket with versioning + DynamoDB lock table.
 - **Access Control:** Restrict S3 bucket access to CI/CD role only.
 - **Sensitive Data:** Use Terraform's `sensitive = true` on variables containing secrets.
+
+---
+
+## Payment Processing & Ledger System
+
+### Payment Flow Architecture
+
+**High-Level Payment Lifecycle:**
+
+```
+Buyer                  EventHub Platform              Payment Gateway           Organizer Account
+│                           │                              │                           │
+├─ Add to Cart              │                              │                           │
+├─ Checkout ─────────────►  │                              │                           │
+│                           ├─ Create Payment Intent      │                           │
+│                           ├──────────────────────────►  │                           │
+│                           │  (Stripe/Razorpay)          │                           │
+│                           │◄──────────────────────────  │                           │
+│                           │  (Returns client secret)    │                           │
+│                           │                              │                           │
+├─ Process Card ───────────►│                              │                           │
+│                           ├─ Stripe/Razorpay JS SDK    │                           │
+│                           │  (Tokenized payment)         │                           │
+│◄─ Confirmation ───────────├◄──────────────────────────┤ (webhook)                 │
+│                           │                              │                           │
+│                           ├─ Record Transaction         │                           │
+│                           │  in Ledger (T1)             │                           │
+│                           ├─ Emit Event                 │                           │
+│                           │  (OrderPaid)                │                           │
+│                           │                              │                           │
+│                           ├─ Calculate Commission       │                           │
+│                           │  (e.g., 10% platform fee)   │                           │
+│                           │                              │                           │
+│                           ├─ Record Net Payout (T2)     │                           │
+│                           │  (to organizer wallet)      │                           │
+│                           │                              │                           │
+│                           ├─ Schedule Payout            │                           │
+│                           │  (daily/weekly settle)       │                           │
+│                           │                              │                           │
+│                           ├─ Transfer to Org Account ──────────────────────────────►│
+│                           │  (via Stripe/Razorpay)      │                           │
+```
+
+### Ledger Schema
+
+**Table 1: Transactions** (immutable ledger of all money movements)
+```sql
+CREATE TABLE Transactions (
+    TransactionId BIGINT PRIMARY KEY IDENTITY,
+    OrganizationId INT NOT NULL,
+    OfferingId INT NOT NULL,           -- Foreign key to Events/Products/Fundraisers table
+    BuyerId INT NOT NULL,              -- Who paid
+    OrderId INT,                       -- Reference to Orders table
+    TransactionType NVARCHAR(50),      -- 'ticket_purchase', 'product_purchase', 'donation', 'refund'
+    AmountGross DECIMAL(12,2),         -- Total paid (e.g., 100.00 USD)
+    PlatformFeePercent DECIMAL(5,2),   -- Commission rate (e.g., 10.0 for 10%)
+    PlatformFeeAmount DECIMAL(12,2),   -- Calculated fee (e.g., 10.00)
+    OrganizerNetAmount DECIMAL(12,2),  -- Amount organizer keeps (e.g., 90.00)
+    Currency NVARCHAR(3),              -- 'USD', 'INR', etc.
+    PaymentMethodId NVARCHAR(255),     -- Reference to payment source (tokenized)
+    PaymentGateway NVARCHAR(50),       -- 'stripe', 'razorpay'
+    ExternalTransactionId NVARCHAR(255), -- Stripe/Razorpay transaction ID
+    Status NVARCHAR(50),               -- 'pending', 'completed', 'failed', 'refunded'
+    CreatedAt DATETIME2 DEFAULT GETUTCDATE(),
+    CompletedAt DATETIME2,
+    RefundedAt DATETIME2,
+    Metadata NVARCHAR(MAX),            -- JSON: additional context (coupon applied, etc.)
+    FOREIGN KEY (OrganizationId) REFERENCES Organizations(OrganizationId),
+    FOREIGN KEY (BuyerId) REFERENCES Users(UserId)
+);
+
+-- Index for quick lookups
+CREATE INDEX idx_transactions_org_offering ON Transactions(OrganizationId, OfferingId);
+CREATE INDEX idx_transactions_status ON Transactions(Status, CreatedAt DESC);
+```
+
+**Table 2: Payouts** (scheduled and completed payouts to organizers)
+```sql
+CREATE TABLE Payouts (
+    PayoutId BIGINT PRIMARY KEY IDENTITY,
+    OrganizationId INT NOT NULL,
+    PayoutStatus NVARCHAR(50),         -- 'pending', 'processing', 'completed', 'failed'
+    PayoutMethod NVARCHAR(50),         -- 'bank_transfer', 'stripe_connect', 'razorpay_contact'
+    PayoutExternalId NVARCHAR(255),    -- Reference from payment gateway
+    SettlementPeriodStart DATETIME2,   -- e.g., 2025-01-01
+    SettlementPeriodEnd DATETIME2,     -- e.g., 2025-01-07
+    TotalAmount DECIMAL(12,2),         -- Total payout amount
+    TransactionCount INT,              -- Number of transactions in this payout
+    ScheduledAt DATETIME2,
+    ProcessedAt DATETIME2,
+    FailureReason NVARCHAR(MAX),
+    CreatedAt DATETIME2 DEFAULT GETUTCDATE(),
+    FOREIGN KEY (OrganizationId) REFERENCES Organizations(OrganizationId)
+);
+
+CREATE INDEX idx_payouts_org_status ON Payouts(OrganizationId, PayoutStatus);
+```
+
+**Table 3: TransactionLog** (audit trail for compliance)
+```sql
+CREATE TABLE TransactionLog (
+    LogId BIGINT PRIMARY KEY IDENTITY,
+    TransactionId BIGINT,
+    ChangeType NVARCHAR(50),           -- 'created', 'cancelled', 'refunded', 'disputed'
+    OldValue NVARCHAR(MAX),            -- Previous state (JSON)
+    NewValue NVARCHAR(MAX),            -- New state (JSON)
+    ChangedBy INT,                     -- UserId who triggered change (admin/system)
+    ChangedAt DATETIME2 DEFAULT GETUTCDATE(),
+    Reason NVARCHAR(MAX),              -- Why was it changed? (e.g., customer request)
+    FOREIGN KEY (TransactionId) REFERENCES Transactions(TransactionId),
+    FOREIGN KEY (ChangedBy) REFERENCES Users(UserId)
+);
+```
+
+### Commission Configuration
+
+**Table: CommissionRules** (flexible commission rates by offering type, organizer tier, or global default)
+```sql
+CREATE TABLE CommissionRules (
+    CommissionRuleId INT PRIMARY KEY IDENTITY,
+    OrganizationId INT,                -- NULL = global default rule
+    OfferingType NVARCHAR(50),         -- 'event', 'product', 'fundraiser', or NULL = all types
+    FeePercent DECIMAL(5,2),           -- e.g., 10.0 for 10%
+    MinimumFee DECIMAL(12,2),          -- Minimum absolute fee (e.g., 0.50)
+    EffectiveFrom DATETIME2,
+    EffectiveUntil DATETIME2,
+    CreatedAt DATETIME2 DEFAULT GETUTCDATE(),
+    FOREIGN KEY (OrganizationId) REFERENCES Organizations(OrganizationId)
+);
+
+-- Example data:
+-- Global default: 10% on all transaction types
+-- INSERT INTO CommissionRules (OrganizationId, OfferingType, FeePercent, EffectiveFrom)
+-- VALUES (NULL, NULL, 10.0, GETUTCDATE());
+
+-- Premium tier organizer (5% fee)
+-- INSERT INTO CommissionRules (OrganizationId, OfferingType, FeePercent, EffectiveFrom)
+-- VALUES (123, NULL, 5.0, GETUTCDATE());
+```
+
+### Payment Processing Logic (C# Service)
+
+```csharp
+// src/Application/Services/PaymentService.cs
+public interface IPaymentService
+{
+    Task<PaymentIntentResponse> CreatePaymentIntentAsync(CreatePaymentRequest request, CancellationToken ct);
+    Task<Transaction> ConfirmPaymentAsync(string paymentIntentId, CancellationToken ct);
+    Task<bool> RefundTransactionAsync(long transactionId, string reason, CancellationToken ct);
+    Task<Payout> SchedulePayoutAsync(int organizationId, DateTime settlementPeriodEnd, CancellationToken ct);
+}
+
+public class PaymentService : IPaymentService
+{
+    private readonly ApplicationDbContext _context;
+    private readonly IStripeClient _stripeClient;  // Stripe or Razorpay adapter
+    private readonly ILogger<PaymentService> _logger;
+
+    public async Task<PaymentIntentResponse> CreatePaymentIntentAsync(
+        CreatePaymentRequest request, 
+        CancellationToken ct)
+    {
+        // Fetch offering details and calculate fees
+        var offering = await _context.Offerings
+            .FirstOrDefaultAsync(o => o.OfferingId == request.OfferingId, ct);
+
+        var organization = await _context.Organizations
+            .FirstOrDefaultAsync(o => o.OrganizationId == offering.OrganizationId, ct);
+
+        var commissionRule = await GetApplicableCommissionRuleAsync(
+            organization.OrganizationId, 
+            offering.OfferingType, 
+            ct);
+
+        var platformFee = request.Amount * (commissionRule.FeePercent / 100m);
+        var organizerNetAmount = request.Amount - platformFee;
+
+        // Create payment intent with Stripe/Razorpay
+        var paymentIntent = await _stripeClient.CreatePaymentIntentAsync(
+            new PaymentIntentRequest
+            {
+                Amount = (long)(request.Amount * 100),  // Convert to cents
+                Currency = request.Currency,
+                Metadata = new Dictionary<string, string>
+                {
+                    { "organizationId", organization.OrganizationId.ToString() },
+                    { "offeringId", offering.OfferingId.ToString() },
+                    { "buyerId", request.BuyerId.ToString() }
+                }
+            },
+            ct);
+
+        _logger.LogInformation(
+            "Created payment intent {PaymentIntentId} for offering {OfferingId}",
+            paymentIntent.ClientSecret,
+            offering.OfferingId);
+
+        return new PaymentIntentResponse
+        {
+            ClientSecret = paymentIntent.ClientSecret,
+            Amount = request.Amount,
+            Currency = request.Currency
+        };
+    }
+
+    public async Task<Transaction> ConfirmPaymentAsync(string paymentIntentId, CancellationToken ct)
+    {
+        // Retrieve payment result from Stripe/Razorpay
+        var paymentResult = await _stripeClient.RetrievePaymentIntentAsync(paymentIntentId, ct);
+
+        if (paymentResult.Status != "succeeded")
+        {
+            _logger.LogWarning("Payment intent {PaymentIntentId} failed with status {Status}",
+                paymentIntentId, paymentResult.Status);
+            return null;
+        }
+
+        // Extract metadata
+        var organizationId = int.Parse(paymentResult.Metadata["organizationId"]);
+        var offeringId = int.Parse(paymentResult.Metadata["offeringId"]);
+        var buyerId = int.Parse(paymentResult.Metadata["buyerId"]);
+
+        // Calculate fees
+        var amountGross = paymentResult.Amount / 100m;  // Convert from cents
+        var commissionRule = await GetApplicableCommissionRuleAsync(organizationId, null, ct);
+        var platformFeeAmount = amountGross * (commissionRule.FeePercent / 100m);
+        var organizerNetAmount = amountGross - platformFeeAmount;
+
+        // Create transaction record (immutable ledger entry)
+        var transaction = new Transaction
+        {
+            OrganizationId = organizationId,
+            OfferingId = offeringId,
+            BuyerId = buyerId,
+            TransactionType = "ticket_purchase",
+            AmountGross = amountGross,
+            PlatformFeePercent = commissionRule.FeePercent,
+            PlatformFeeAmount = platformFeeAmount,
+            OrganizerNetAmount = organizerNetAmount,
+            Currency = paymentResult.Currency,
+            PaymentGateway = "stripe",  // or 'razorpay'
+            ExternalTransactionId = paymentIntentId,
+            Status = "completed",
+            CompletedAt = DateTime.UtcNow
+        };
+
+        _context.Transactions.Add(transaction);
+
+        // Create payout record (organizer's pending balance)
+        var payout = await _context.Payouts
+            .FirstOrDefaultAsync(p => 
+                p.OrganizationId == organizationId &&
+                p.PayoutStatus == "pending", 
+            ct);
+
+        if (payout == null)
+        {
+            payout = new Payout
+            {
+                OrganizationId = organizationId,
+                PayoutStatus = "pending",
+                SettlementPeriodStart = DateTime.UtcNow.StartOfDay(),
+                SettlementPeriodEnd = DateTime.UtcNow.AddDays(7).EndOfDay(),
+                TotalAmount = organizerNetAmount,
+                TransactionCount = 1
+            };
+            _context.Payouts.Add(payout);
+        }
+        else
+        {
+            payout.TotalAmount += organizerNetAmount;
+            payout.TransactionCount++;
+        }
+
+        await _context.SaveChangesAsync(ct);
+
+        _logger.LogInformation(
+            "Confirmed transaction {TransactionId} for organizer {OrgId}, net amount {NetAmount}",
+            transaction.TransactionId, organizationId, organizerNetAmount);
+
+        return transaction;
+    }
+
+    public async Task<bool> RefundTransactionAsync(long transactionId, string reason, CancellationToken ct)
+    {
+        var transaction = await _context.Transactions
+            .FirstOrDefaultAsync(t => t.TransactionId == transactionId, ct);
+
+        if (transaction == null)
+            return false;
+
+        // Refund via payment gateway
+        var refundResult = await _stripeClient.RefundPaymentAsync(
+            transaction.ExternalTransactionId, ct);
+
+        if (!refundResult.Success)
+            return false;
+
+        // Update transaction status
+        transaction.Status = "refunded";
+        transaction.RefundedAt = DateTime.UtcNow;
+
+        // Create audit log entry
+        var logEntry = new TransactionLog
+        {
+            TransactionId = transactionId,
+            ChangeType = "refunded",
+            OldValue = JsonSerializer.Serialize(new { status = "completed" }),
+            NewValue = JsonSerializer.Serialize(new { status = "refunded" }),
+            ChangedBy = 0,  // System user
+            Reason = reason
+        };
+        _context.TransactionLogs.Add(logEntry);
+
+        await _context.SaveChangesAsync(ct);
+
+        _logger.LogInformation("Refunded transaction {TransactionId}, reason: {Reason}",
+            transactionId, reason);
+
+        return true;
+    }
+
+    public async Task<Payout> SchedulePayoutAsync(int organizationId, DateTime settlementPeriodEnd, CancellationToken ct)
+    {
+        // Fetch pending payout
+        var payout = await _context.Payouts
+            .FirstOrDefaultAsync(p =>
+                p.OrganizationId == organizationId &&
+                p.PayoutStatus == "pending",
+            ct);
+
+        if (payout == null)
+            return null;
+
+        // Mark as processing
+        payout.PayoutStatus = "processing";
+        payout.ScheduledAt = DateTime.UtcNow;
+
+        await _context.SaveChangesAsync(ct);
+
+        // Async task: Transfer funds to organizer account (via payment gateway)
+        _ = ProcessPayoutAsync(payout, ct);  // Fire and forget with proper logging
+
+        return payout;
+    }
+
+    private async Task ProcessPayoutAsync(Payout payout, CancellationToken ct)
+    {
+        try
+        {
+            // Fetch organizer's payment account (bank details, Stripe Connect, etc.)
+            var organization = await _context.Organizations
+                .FirstOrDefaultAsync(o => o.OrganizationId == payout.OrganizationId, ct);
+
+            // Call payment gateway to transfer
+            var payoutResult = await _stripeClient.CreatePayoutAsync(
+                new PayoutRequest
+                {
+                    Amount = (long)(payout.TotalAmount * 100),
+                    Currency = "usd",
+                    Destination = organization.PaymentAccountId  // Stripe Connect or bank account
+                },
+                ct);
+
+            payout.PayoutExternalId = payoutResult.Id;
+            payout.PayoutStatus = "completed";
+            payout.ProcessedAt = DateTime.UtcNow;
+
+            _logger.LogInformation(
+                "Processed payout {PayoutId} to organization {OrgId}, amount {Amount}",
+                payout.PayoutId, payout.OrganizationId, payout.TotalAmount);
+        }
+        catch (Exception ex)
+        {
+            payout.PayoutStatus = "failed";
+            payout.FailureReason = ex.Message;
+
+            _logger.LogError(ex, "Failed to process payout {PayoutId}", payout.PayoutId);
+        }
+
+        await _context.SaveChangesAsync(ct);
+    }
+
+    private async Task<CommissionRule> GetApplicableCommissionRuleAsync(
+        int organizationId, 
+        string offeringType, 
+        CancellationToken ct)
+    {
+        // Try organization-specific rule first
+        var rule = await _context.CommissionRules
+            .Where(r =>
+                r.OrganizationId == organizationId &&
+                (r.OfferingType == null || r.OfferingType == offeringType) &&
+                r.EffectiveFrom <= DateTime.UtcNow &&
+                (r.EffectiveUntil == null || r.EffectiveUntil >= DateTime.UtcNow))
+            .OrderByDescending(r => r.EffectiveFrom)
+            .FirstOrDefaultAsync(ct);
+
+        // Fall back to global rule
+        if (rule == null)
+        {
+            rule = await _context.CommissionRules
+                .Where(r =>
+                    r.OrganizationId == null &&
+                    (r.OfferingType == null || r.OfferingType == offeringType) &&
+                    r.EffectiveFrom <= DateTime.UtcNow &&
+                    (r.EffectiveUntil == null || r.EffectiveUntil >= DateTime.UtcNow))
+                .OrderByDescending(r => r.EffectiveFrom)
+                .FirstOrDefaultAsync(ct);
+        }
+
+        return rule ?? new CommissionRule { FeePercent = 10.0m };  // Default 10%
+    }
+}
+```
+
+### GraphQL Mutations for Payment & Payout
+
+```graphql
+# Payment-related mutations
+mutation CreatePaymentIntent(
+  $offeringId: Int!
+  $amount: Float!
+  $currency: String!
+) {
+  createPaymentIntent(
+    input: {
+      offeringId: $offeringId
+      amount: $amount
+      currency: $currency
+    }
+  ) {
+    clientSecret
+    amount
+    currency
+  }
+}
+
+mutation ConfirmPayment($paymentIntentId: String!) {
+  confirmPayment(paymentIntentId: $paymentIntentId) {
+    transactionId
+    status
+    amountGross
+    organizerNetAmount
+    completedAt
+  }
+}
+
+mutation RefundTransaction($transactionId: Long!, $reason: String!) {
+  refundTransaction(transactionId: $transactionId, reason: $reason) {
+    success
+    reason
+  }
+}
+
+# Payout-related queries and mutations
+query GetOrganizerBalance($organizationId: Int!) {
+  organizerBalance(organizationId: $organizationId) {
+    pendingAmount
+    payoutSchedule {
+      payoutId
+      amount
+      status
+      scheduledDate
+    }
+  }
+}
+
+mutation RequestPayout($organizationId: Int!) {
+  requestPayout(organizationId: $organizationId) {
+    payoutId
+    status
+    amount
+    scheduledAt
+  }
+}
+```
+
+---
+
+## Multi-Offering Strategy (Events, Products, Fundraising)
+
+### Overview
+
+EventHub supports three primary offering types, with a flexible polymorphic design to accommodate future additions:
+
+1. **Events** — Time-based, ticketed offerings (concerts, conferences, workshops)
+2. **Products** — Inventory-based, non-time-bound offerings (merchandise, digital goods)
+3. **Fundraisers** — Goal-based offerings with milestone unlocking (charity drives, campaigns)
+
+All three share common attributes (organizer, revenue tracking, buyer visibility) but have unique properties (event dates, inventory levels, fundraising goals).
+
+### Polymorphic Schema Design
+
+**Base Offering Table:**
+```sql
+CREATE TABLE Offerings (
+    OfferingId INT PRIMARY KEY IDENTITY,
+    OrganizationId INT NOT NULL,
+    OfferingType NVARCHAR(50) NOT NULL,  -- 'event', 'product', 'fundraiser'
+    Title NVARCHAR(255) NOT NULL,
+    Description NVARCHAR(MAX),
+    ImageUrl NVARCHAR(MAX),
+    CreatedAt DATETIME2 DEFAULT GETUTCDATE(),
+    PublishedAt DATETIME2,
+    Status NVARCHAR(50),                 -- 'draft', 'published', 'archived', 'cancelled'
+    Metadata NVARCHAR(MAX),              -- JSON: common attributes (tags, categories, etc.)
+    FOREIGN KEY (OrganizationId) REFERENCES Organizations(OrganizationId)
+);
+
+-- Type-specific tables with foreign key to Offerings
+CREATE TABLE Events (
+    EventId INT PRIMARY KEY IDENTITY,
+    OfferingId INT UNIQUE NOT NULL,
+    EventDate DATETIME2 NOT NULL,
+    EndDate DATETIME2,
+    Venue NVARCHAR(MAX),
+    Capacity INT,
+    AttendeesCount INT DEFAULT 0,
+    IsRecurring BIT DEFAULT 0,
+    RecurrencePattern NVARCHAR(MAX),    -- JSON: 'daily', 'weekly', 'monthly', etc.
+    FOREIGN KEY (OfferingId) REFERENCES Offerings(OfferingId)
+);
+
+CREATE TABLE Products (
+    ProductId INT PRIMARY KEY IDENTITY,
+    OfferingId INT UNIQUE NOT NULL,
+    SKU NVARCHAR(100) UNIQUE,
+    Quantity INT NOT NULL,              -- Available inventory
+    QuantitySold INT DEFAULT 0,
+    IsPhysical BIT,                     -- Physical goods require shipping; digital do not
+    ShippingWeight DECIMAL(8,2),        -- For physical products
+    DigitalDownloadUrl NVARCHAR(MAX),   -- For digital products
+    FOREIGN KEY (OfferingId) REFERENCES Offerings(OfferingId)
+);
+
+CREATE TABLE Fundraisers (
+    FundraiserId INT PRIMARY KEY IDENTITY,
+    OfferingId INT UNIQUE NOT NULL,
+    GoalAmount DECIMAL(12,2) NOT NULL,
+    CurrentAmount DECIMAL(12,2) DEFAULT 0,
+    DeadlineDate DATETIME2,
+    MinimumContribution DECIMAL(12,2),  -- Minimum donation per transaction
+    Milestones NVARCHAR(MAX),          -- JSON array: [{amount: 1000, unlocks: "free_tshirt"}, ...]
+    FOREIGN KEY (OfferingId) REFERENCES Offerings(OfferingId)
+);
+
+-- Tier/Pricing for products and fundraisers (optional, for flexibility)
+CREATE TABLE OfferingTiers (
+    TierId INT PRIMARY KEY IDENTITY,
+    OfferingId INT NOT NULL,
+    TierName NVARCHAR(100),
+    Price DECIMAL(12,2),
+    Description NVARCHAR(MAX),
+    Quantity INT,                       -- For limited tiers
+    Benefits NVARCHAR(MAX),             -- JSON: list of benefits/perks
+    FOREIGN KEY (OfferingId) REFERENCES Offerings(OfferingId)
+);
+```
+
+### Querying Mixed Offering Types
+
+**GraphQL Schema:**
+```graphql
+type Offering {
+  offeringId: Int!
+  organizationId: Int!
+  offeringType: OfferingType!  # ENUM: EVENT, PRODUCT, FUNDRAISER
+  title: String!
+  description: String
+  imageUrl: String
+  status: OfferingStatus!
+  createdAt: DateTime!
+  publishedAt: DateTime
+  
+  # Type-specific fields (union types)
+  asEvent: Event
+  asProduct: Product
+  asFundraiser: Fundraiser
+}
+
+type Event {
+  eventId: Int!
+  offering: Offering!
+  eventDate: DateTime!
+  endDate: DateTime
+  venue: String
+  capacity: Int
+  attendeesCount: Int!
+  isRecurring: Boolean
+}
+
+type Product {
+  productId: Int!
+  offering: Offering!
+  sku: String
+  quantity: Int!
+  quantitySold: Int!
+  isPhysical: Boolean
+  digitalDownloadUrl: String
+}
+
+type Fundraiser {
+  fundraiserId: Int!
+  offering: Offering!
+  goalAmount: Float!
+  currentAmount: Float!
+  deadlineDate: DateTime
+  minimumContribution: Float
+  milestones: [Milestone!]!
+  progressPercent: Float!
+}
+
+enum OfferingType {
+  EVENT
+  PRODUCT
+  FUNDRAISER
+}
+
+# Query examples
+query GetOrganizationOfferings($organizationId: Int!, $type: OfferingType) {
+  offerings(organizationId: $organizationId, type: $type) {
+    offeringId
+    title
+    status
+    
+    # Conditional fields based on type
+    asEvent {
+      eventDate
+      venue
+    }
+    asProduct {
+      quantity
+      quantitySold
+    }
+    asFundraiser {
+      goalAmount
+      currentAmount
+      progressPercent
+    }
+  }
+}
+
+query GetOfferingDetails($offeringId: Int!) {
+  offering(offeringId: $offeringId) {
+    offeringId
+    title
+    description
+    offeringType
+    
+    # Load specific type details
+    asEvent {
+      eventDate
+      endDate
+      venue
+      capacity
+      attendeesCount
+    }
+  }
+}
+```
+
+### C# Resolver for Polymorphic Offerings
+
+```csharp
+// src/GraphQL/Resolvers/OfferingResolver.cs
+public class OfferingResolver
+{
+    private readonly ApplicationDbContext _context;
+
+    public async Task<List<Offering>> GetOrganizationOfferingsAsync(
+        int organizationId,
+        string? offeringType,
+        CancellationToken ct)
+    {
+        var query = _context.Offerings
+            .Where(o => o.OrganizationId == organizationId);
+
+        if (!string.IsNullOrEmpty(offeringType))
+            query = query.Where(o => o.OfferingType == offeringType);
+
+        return await query
+            .OrderByDescending(o => o.PublishedAt ?? o.CreatedAt)
+            .ToListAsync(ct);
+    }
+
+    public async Task<Offering?> GetOfferingWithDetailsAsync(int offeringId, CancellationToken ct)
+    {
+        return await _context.Offerings
+            .Include(o => o.Events)  // Eager load if it's an event
+            .Include(o => o.Products)  // Eager load if it's a product
+            .Include(o => o.Fundraisers)  // Eager load if it's a fundraiser
+            .FirstOrDefaultAsync(o => o.OfferingId == offeringId, ct);
+    }
+
+    public async Task<Event?> GetEventAsync([Parent] Offering offering, CancellationToken ct)
+    {
+        if (offering.OfferingType != "event")
+            return null;
+
+        return await _context.Events
+            .FirstOrDefaultAsync(e => e.OfferingId == offering.OfferingId, ct);
+    }
+
+    public async Task<Product?> GetProductAsync([Parent] Offering offering, CancellationToken ct)
+    {
+        if (offering.OfferingType != "product")
+            return null;
+
+        return await _context.Products
+            .FirstOrDefaultAsync(p => p.OfferingId == offering.OfferingId, ct);
+    }
+
+    public async Task<Fundraiser?> GetFundraiserAsync([Parent] Offering offering, CancellationToken ct)
+    {
+        if (offering.OfferingType != "fundraiser")
+            return null;
+
+        return await _context.Fundraisers
+            .FirstOrDefaultAsync(f => f.OfferingId == offering.OfferingId, ct);
+    }
+}
+
+// Resolver type for strong typing in GraphQL
+[ObjectType("Event")]
+public class EventType
+{
+    public int EventId { get; set; }
+    public DateTime EventDate { get; set; }
+    public DateTime? EndDate { get; set; }
+    public string? Venue { get; set; }
+    public int? Capacity { get; set; }
+    public int AttendeesCount { get; set; }
+
+    [GraphQLType(typeof(StringType))]
+    public string? RecurrencePattern { get; set; }
+}
+
+[ObjectType("Product")]
+public class ProductType
+{
+    public int ProductId { get; set; }
+    public string? SKU { get; set; }
+    public int Quantity { get; set; }
+    public int QuantitySold { get; set; }
+    public bool IsPhysical { get; set; }
+    public string? DigitalDownloadUrl { get; set; }
+}
+
+[ObjectType("Fundraiser")]
+public class FundraiserType
+{
+    public int FundraiserId { get; set; }
+    public decimal GoalAmount { get; set; }
+    public decimal CurrentAmount { get; set; }
+    public DateTime? DeadlineDate { get; set; }
+    public decimal? MinimumContribution { get; set; }
+
+    [GraphQLName("progressPercent")]
+    public double GetProgressPercent() => 
+        GoalAmount > 0 ? (double)(CurrentAmount / GoalAmount * 100) : 0;
+}
+```
+
+### Dashboard Views by Offering Type
+
+**Organizer Dashboard (All Offerings):**
+```sql
+-- View: Summary of all offerings for an organizer
+CREATE VIEW OrganizationOfferingsSummary AS
+SELECT
+    o.OfferingId,
+    o.OrganizationId,
+    o.OfferingType,
+    o.Title,
+    o.Status,
+    ISNULL(e.EventDate, NULL) AS EventDate,
+    ISNULL(p.Quantity - p.QuantitySold, NULL) AS InventoryRemaining,
+    ISNULL(f.GoalAmount, 0) AS FundraiserGoal,
+    ISNULL(f.CurrentAmount, 0) AS FundraiserCurrent,
+    (SELECT ISNULL(SUM(AmountGross), 0)
+     FROM Transactions
+     WHERE OfferingId = o.OfferingId AND Status = 'completed') AS TotalRevenue,
+    (SELECT COUNT(DISTINCT BuyerId)
+     FROM Transactions
+     WHERE OfferingId = o.OfferingId AND Status = 'completed') AS BuyerCount,
+    o.CreatedAt,
+    o.PublishedAt
+FROM Offerings o
+LEFT JOIN Events e ON o.OfferingId = e.OfferingId
+LEFT JOIN Products p ON o.OfferingId = p.OfferingId
+LEFT JOIN Fundraisers f ON o.OfferingId = f.OfferingId;
+```
+
+---
+
+## Security & Compliance
+
+### Data Isolation & Tenant Enforcement
+
+1. **Application Layer (GraphQL Resolvers):**
+   ```csharp
+   // src/GraphQL/Resolvers/OfferingResolver.cs
+   [Authorize]
+   public async Task<Offering?> GetOfferingAsync(
+       int offeringId,
+       [Service] ApplicationDbContext context,
+       ClaimsPrincipal user,  // Injected from JWT claims
+       CancellationToken ct)
+   {
+       var userOrgId = int.Parse(user.FindFirst("organizationId")?.Value ?? "0");
+
+       var offering = await context.Offerings
+           .FirstOrDefaultAsync(o => o.OfferingId == offeringId, ct);
+
+       // Enforce tenant isolation: only allow access if organizer owns the offering
+       if (offering?.OrganizationId != userOrgId && !user.IsInRole("admin"))
+           throw new UnauthorizedAccessException("Not authorized to access this offering.");
+
+       return offering;
+   }
+   ```
+
+2. **Database Layer (SQL Server Row-Level Security — Optional but Recommended):**
+   ```sql
+   -- Create security policy to enforce tenant isolation at DB level
+   CREATE SCHEMA Security;
+
+   CREATE FUNCTION Security.TenantAccessPredicate(@OrganizationId INT)
+   RETURNS TABLE
+   WITH SCHEMABINDING
+   AS
+   RETURN SELECT 1 AS AccessResult
+   WHERE @OrganizationId = CAST(SESSION_CONTEXT(N'OrganizationId') AS INT)
+       OR CAST(SESSION_CONTEXT(N'IsAdmin') AS BIT) = 1;
+
+   -- Apply policy to Offerings table
+   CREATE SECURITY POLICY OfferingsTenantFilter
+   ADD FILTER PREDICATE Security.TenantAccessPredicate(OrganizationId)
+   ON dbo.Offerings
+   WITH (STATE = ON);
+
+   -- On connection, set the tenant context
+   -- EXECUTE sp_set_session_context @key=N'OrganizationId', @value=<user_org_id>;
+   ```
+
+### PCI Compliance for Payments
+
+- **No raw credit card storage** — All card data tokenized via Stripe/Razorpay.
+- **Webhook validation** — Verify webhook signatures from payment gateway before processing.
+- **Encrypted storage** — Sensitive data (payment method IDs, refund reasons) encrypted at rest.
+- **Audit logging** — Every transaction change logged with timestamp, actor, and reason.
+
+### GDPR Compliance
+
+1. **Data Export (Right to Data Portability):**
+   ```graphql
+   mutation RequestDataExport($userId: Int!) {
+     requestDataExport(userId: $userId) {
+       exportId
+       status  # 'pending', 'processing', 'completed'
+       expiresAt
+       downloadUrl
+     }
+   }
+   ```
+
+2. **Account Deletion (Right to be Forgotten):**
+   ```graphql
+   mutation DeleteAccount($userId: Int!, $reason: String!) {
+     deleteAccount(userId: $userId, reason: $reason) {
+       success
+       anonymizedAt
+     }
+   }
+   ```
+   - Buyer data: Anonymized (names, emails, addresses replaced with hashes).
+   - Transaction ledger: Retained for audit trail but buyer identity removed.
+
+3. **Consent Tracking:**
+   ```sql
+   CREATE TABLE UserConsents (
+       ConsentId INT PRIMARY KEY IDENTITY,
+       UserId INT NOT NULL,
+       ConsentType NVARCHAR(100),  -- 'marketing', 'analytics', 'terms'
+       IsGranted BIT,
+       GrantedAt DATETIME2,
+       RevokedAt DATETIME2,
+       IpAddress NVARCHAR(50),
+       FOREIGN KEY (UserId) REFERENCES Users(UserId)
+   );
+   ```
+
+### Rate Limiting & DDoS Protection
+
+```csharp
+// Program.cs - Add rate limiting middleware
+builder.Services.AddRateLimiter(options =>
+{
+    options.AddFixedWindowLimiter(
+        policyName: "fixed",
+        options => 
+        {
+            options.Window = TimeSpan.FromSeconds(60);
+            options.PermitLimit = 100;  // 100 requests per minute
+        });
+});
+
+app.UseRateLimiter();
+
+// GraphQL endpoint with rate limiting
+app.MapGraphQL("/graphql")
+    .RequireRateLimiting("fixed");
+```
+
+### CSRF & CORS Configuration
+
+```csharp
+// Program.cs
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("GraphQL", policy =>
+    {
+        policy.WithOrigins("https://app.eventhub.com", "https://localhost:3000")
+              .AllowAnyMethod()
+              .AllowAnyHeader()
+              .AllowCredentials()
+              .WithExposedHeaders("X-Total-Count");  // For pagination
+    });
+});
+
+app.UseCors("GraphQL");
+
+// CSRF token handling (if using traditional forms, else not needed for SPA + JWT)
+// For SPA with JWT: CSRF protection via Same-Site cookies
+app.Use(async (context, next) =>
+{
+    context.Response.Headers.Add("X-Frame-Options", "DENY");
+    context.Response.Headers.Add("X-Content-Type-Options", "nosniff");
+    context.Response.Headers.Add("X-XSS-Protection", "1; mode=block");
+    await next();
+});
+```
+
+### Secrets Management
+
+**AWS Secrets Manager Integration (Production):**
+```csharp
+// Program.cs
+var builder = WebApplicationBuilder.CreateBuilder(args);
+
+if (builder.Environment.IsProduction())
+{
+    var secretsManagerClient = new AmazonSecretsManagerClient(RegionEndpoint.USEast1);
+    
+    builder.Configuration.AddSecretsManager(
+        client: secretsManagerClient,
+        secretFilter: secret => secret.Name.StartsWith("prod/")
+    );
+}
+
+// Access secrets
+var stripeKey = builder.Configuration["prod/stripe/secret-key"];
+var dbPassword = builder.Configuration["prod/database/password"];
+```
+
+**Environment Variables (Local Development — Never commit!):**
+```bash
+# .env.local (DO NOT commit)
+STRIPE_SECRET_KEY=sk_test_xxx
+RAZORPAY_KEY_SECRET=key_secret_xxx
+DB_PASSWORD=YourPassword123!
+JWT_SECRET=your-256-bit-secret-key
+```
 
 ---
 
